@@ -1,8 +1,15 @@
 #include <iostream>
+#include <fstream>
 
 #include <stdio.h>
 
 #include "errors.hpp"
+
+#define ACC 1024
+#define TIMEAVG 8
+#define TIMESCALE 0.125
+#define FFTOUT 513
+#define FFTUSE 512
 
 using std::cout;
 using std::endl;
@@ -39,6 +46,75 @@ __global__ void UnpackKernel(unsigned char **in, float **out, int nopols, int by
     }
 }
 
+__global__ void UnpackKernelOpt(unsigned char **in, float **out, int nopols, int bytesperthread, int rem, size_t samples, int unpack)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < samples) {
+	for (int ipol = 0; ipol < 2; ++ipol) {
+	    unsigned char inval = in[ipol][idx];
+	    out[ipol][idx * unpack] = static_cast<float>(static_cast<short>((inval & 0x03)));
+            out[ipol][idx * unpack + 1] = static_cast<float>(static_cast<short>((inval & 0x0C >> 2)));
+            out[ipol][idx * unpack + 2] = static_cast<float>(static_cast<short>((inval & 0x30 >> 4)));
+            out[ipol][idx * unpack + 3] = static_cast<float>(static_cast<short>((inval & 0xC0 >> 6)));
+        }
+    }
+}
+
+// NOTE: This kernel assumes that 2-bit data sampling is used
+__global__ void UnpackKernelOpt2(unsigned char **in, float **out, int nopols, int perblock, size_t samples)
+{
+
+    int idx = blockIdx.x * blockDim.x * perblock + threadIdx.x;
+
+    for (int isamp = 0; isamp < perblock; ++isamp) {
+
+        idx += blockDim.x;
+
+        if (idx < samples) {
+            for (int ipol = 0; ipol < 2; ++ipol) {
+                unsigned char inval = in[ipol][idx];
+		// NOTE: Strided access - the worst of its kind - might need to used shared memory here
+                out[ipol][idx * 4] = static_cast<float>(static_cast<short>((inval & 0x03))); 
+                out[ipol][idx * 4 + 1] = static_cast<float>(static_cast<short>((inval & 0x0C >> 2)));
+                out[ipol][idx * 4 + 2] = static_cast<float>(static_cast<short>((inval & 0x30 >> 4)));
+                out[ipol][idx * 4 + 3] = static_cast<float>(static_cast<short>((inval & 0xC0 >> 6)));
+            }
+        }
+    }
+}
+
+__global__ void UnpackKernelOpt3(unsigned char **in, float **out, int nopols, int perblock, size_t samples)
+{
+
+    int idx = blockIdx.x * blockDim.x * perblock + threadIdx.x;
+    int tmod = threadIdx.x % 4;
+
+    // NOTE: Each thread can store one value
+    __shared__ unsigned char incoming[1024];
+
+    int outidx = blockIdx.x * blockDim.x * perblock * 4;
+
+    for (int isamp = 0; isamp < perblock; ++isamp) {
+        if (idx < samples) {
+            for (int ipol = 0; ipol < 2; ++ipol) {
+                incoming[threadIdx.x] = in[ipol][idx];
+                __syncthreads();
+                int outidx2 = outidx + threadIdx.x;
+		for (int ichunk = 0; ichunk < 4; ++ichunk) {
+                    int inidx = threadIdx.x / 4 + ichunk * 256;
+                    unsigned char inval = incoming[inidx];
+                    out[ipol][outidx2] = static_cast<float>(static_cast<short>(((inval & kMask[tmod]) >> (2 * tmod))));
+                    outidx2 += 1024;
+                }
+            }
+        }
+        idx += blockDim.x;
+        outidx += blockDim.x * 4;
+    }
+}
+
+
 __global__ void PowerScaleKernel(cufftComplex **in, unsigned char **out, int avgfreq, int avgtime, int nchans, int outsampperblock,
                                     int inskip, int nogulps, int gulpsize, int extra, unsigned int framet,
                                     unsigned int perframe)
@@ -59,34 +135,121 @@ __global__ void PowerScaleKernel(cufftComplex **in, unsigned char **out, int avg
 		//inidx = inskip + blockIdx.x * outsampperblock * avgtime * nchans * avgfreq + ichunk * avgtime * nchans * avgfreq + isamp * nchans * avgfreq  + threadIdx.x * avgfreq + ifreq;
                 inidx = inskip + blockIdx.x * outsampperblock * avgtime * (nchans + 1) * avgfreq + ichunk * avgtime * (nchans + 1) * avgfreq + isamp * (nchans + 1) * avgfreq  + threadIdx.x * avgfreq + ifreq + 1;
                 out[0][outidx] += in[0][inidx].x * in[0][inidx].x + in[0][inidx].y * in[0][inidx].y + in[1][inidx].x * in[1][inidx].x + in[1][inidx].y * in[1][inidx].y;
-                out[1][outidx] += in[0][inidx].x * in[0][inidx].x + in[0][inidx].y * in[0][inidx].y + in[1][inidx].x * in[1][inidx].x + in[1][inidx].y * in[1][inidx].y;
-                out[2][outidx] += 2.0f * in[0][inidx].x * in[1][inidx].x + 2.0f * in[0][inidx].y * in[1][inidx].y;
-                out[3][outidx] += 2.0f * in[0][inidx].x * in[1][inidx].y + 2.0f * in[0][inidx].y * in[1][inidx].x;
+                //out[1][outidx] += in[0][inidx].x * in[0][inidx].x + in[0][inidx].y * in[0][inidx].y + in[1][inidx].x * in[1][inidx].x + in[1][inidx].y * in[1][inidx].y;
+                //out[2][outidx] += 2.0f * in[0][inidx].x * in[1][inidx].x + 2.0f * in[0][inidx].y * in[1][inidx].y;
+                //out[3][outidx] += 2.0f * in[0][inidx].x * in[1][inidx].y + 2.0f * in[0][inidx].y * in[1][inidx].x;
             }
         }
 
         if (filfullidx < extra) {
             out[0][outidx + nogulps * gulpsize * nchans] = out[0][outidx];
-            out[1][outidx + nogulps * gulpsize * nchans] = out[1][outidx];
-            out[2][outidx + nogulps * gulpsize * nchans] = out[2][outidx];
-            out[3][outidx + nogulps * gulpsize * nchans] = out[3][outidx];
+            //out[1][outidx + nogulps * gulpsize * nchans] = out[1][outidx];
+            //out[2][outidx + nogulps * gulpsize * nchans] = out[2][outidx];
+            //out[3][outidx + nogulps * gulpsize * nchans] = out[3][outidx];
         }
+    }
+}
+
+// NOTE: This kernel does not do any frequency averaging - this can really be changed with the size of the FFT
+__global__ void PowerScaleKernelOpt(cufftComplex **in, unsigned char **out, int avgfreq, int avgtime, int nchans, int perblock,
+                                    int inskip, int nogulps, int gulpsize, int extra, unsigned int framet,
+                                    unsigned int perframe)
+{
+    // NOTE: framet should start at 0 and increase by accumulate every time this kernel is called
+    // NOTE: REALLY make sure it starts at 0
+    unsigned int filtime = framet / ACC * gridDim.x * perblock + blockIdx.x * perblock;  
+    unsigned int filidx;
+    // NOTE: Row for every channel and column for every time sample to average over + padding
+    __shared__ cufftComplex pol[FFTUSE][TIMEAVG];
+
+    int inidx = blockIdx.x * FFTOUT * perblock * TIMEAVG + threadIdx.x + 1;
+   
+    float outvalue = 0.0f;
+    cufftComplex polval;
+ 
+    for (int isamp = 0; isamp < perblock; ++isamp) {
+        
+        // NOTE: Read the data from the incoming array
+        for (int ipol = 0; ipol < 2; ++ipol) {
+            for (int iavg = 0; iavg < TIMEAVG; ++iavg) {
+                // NOTE: threadIdx.x + 1 skips the DC compoment - is it the correct thing to do?
+                pol[threadIdx.x][iavg] = in[ipol][inidx + iavg * FFTOUT]; 
+            }
+
+            for (int itime = 0; itime < TIMEAVG; itime++) {
+                polval = pol[threadIdx.x][itime];
+                outvalue += polval.x * polval.x + polval.y * polval.y; 
+            } 
+    
+        }
+
+        filidx = filtime % (nogulps * gulpsize);
+        int outidx = filidx * FFTUSE + threadIdx.x;
+
+        out[0][outidx] = outvalue;
+        // NOTE: Save to the extra part of the buffer
+        if (filidx < extra) {
+            out[0][outidx + nogulps * gulpsize * FFTUSE] = outvalue;
+        }
+        inidx += FFTOUT * TIMEAVG;
+        filtime++;
+        outvalue = 0.0;
+    }
+}
+
+__global__ void PowerScaleKernelOpt2(cufftComplex **in, unsigned char **out, int avgfreq, int avgtime, int nchans, int perblock,
+                                    int inskip, int nogulps, int gulpsize, int extra, unsigned int framet) {
+    // NOTE: framet should start at 0 and increase by accumulate every time this kernel is called
+    // NOTE: REALLY make sure it starts at 0
+    // NOTE: I'M SERIOUS - FRAME TIME CALCULATIONS ARE BASED ON THIS ASSUMPTION
+    unsigned int filtime = framet / ACC * gridDim.x * perblock + blockIdx.x * perblock;
+    unsigned int filidx;
+    unsigned int outidx;
+    int inidx = blockIdx.x * perblock * TIMEAVG * FFTOUT + threadIdx.x + 1;
+
+    float outvalue = 0.0f;
+    cufftComplex polval;
+
+    for (int isamp = 0; isamp < perblock; ++isamp) {
+
+        // NOTE: Read the data from the incoming array
+        for (int ipol = 0; ipol < 2; ++ipol) {
+            for (int iavg = 0; iavg < TIMEAVG; iavg++) {
+                polval = in[ipol][inidx + iavg * FFTOUT];
+                outvalue += polval.x * polval.x + polval.y * polval.y;
+            }
+
+        }
+
+        filidx = filtime % (nogulps * gulpsize);
+        outidx = filidx * FFTUSE + threadIdx.x;
+
+        outvalue *= TIMESCALE;
+
+        out[0][outidx] = outvalue;
+        // NOTE: Save to the extra part of the buffer
+        if (filidx < extra) {
+            out[0][outidx + nogulps * gulpsize * FFTUSE] = outvalue;
+        }
+        inidx += FFTOUT * TIMEAVG;
+        filtime++;
+        outvalue = 0.0;
     }
 }
 
 int main(int argc, char*argv[]) {
 
-    int accumulate = 1024;
+    int accumulate = 4000;
     int vdiflen = 8000;
     int inbits = 2;
     int nopols = 2;
     int nostokes = 4;
 
-    // NOTE: Single buffer for both polarisations
-    unsigned char **rawdata;
-    cudaCheckError(cudaMalloc((void**)&rawdata, accumulate * vdiflen * nopols * sizeof(unsigned char)));
-    float *unpacked;
-    cudaCheckError(cudaMalloc((void**)&unpacked, accumulate * vdiflen * nopols * 4 * sizeof(float)));
+    unsigned char *rawdata = new unsigned char[accumulate * vdiflen];
+
+    for (int isamp = 0; isamp < accumulate * vdiflen; ++isamp) {
+        rawdata[isamp] = isamp % 256;
+    }
 
     // NOTE: BUffers divided per polarisations
     unsigned char **hrawdata = new unsigned char*[nopols];
@@ -94,6 +257,7 @@ int main(int argc, char*argv[]) {
     cufftComplex **hffted = new cufftComplex*[nopols];
     for (int ipol = 0; ipol < nopols; ++ipol) {
         cudaCheckError(cudaMalloc((void**)&hrawdata[ipol], accumulate * vdiflen * sizeof(unsigned char)));
+        cudaCheckError(cudaMemcpy(hrawdata[ipol], rawdata, accumulate * vdiflen * sizeof(unsigned char), cudaMemcpyHostToDevice));
         cudaCheckError(cudaMalloc((void**)&hunpacked[ipol], accumulate * vdiflen * 4 * sizeof(float)));
         cudaCheckError(cudaMalloc((void**)&hffted[ipol], accumulate * vdiflen * 4 * sizeof(cufftComplex)));
     }
@@ -142,6 +306,8 @@ int main(int argc, char*argv[]) {
         cudaCheckError(cudaMalloc((void**)&hfilbuffer[istoke], 131072 * 128 * sizeof(unsigned char)))
     }
 
+    cout << "Allocated the filterbank buffer memory" << endl;
+
     unsigned char **dfilbuffer;
     cudaCheckError(cudaMalloc((void**)&dfilbuffer, nostokes * sizeof(unsigned char*)));
     cudaCheckError(cudaMemcpy(dfilbuffer, hfilbuffer, nostokes * sizeof(unsigned char*), cudaMemcpyHostToDevice));
@@ -149,8 +315,29 @@ int main(int argc, char*argv[]) {
     unsigned int perframe = vdiflen * 8 / inbits / 256 / avgtime;
 
     // NOTE: These kernels have to be as close to the original as possible
-    UnpackKernel<<<cudablocks[0], cudathreads[0], 0, 0>>>(drawdata, dunpacked, nopols, sampperthread, rem, accumulate * vdiflen, 8 / inbits);
+    // NOTE: Sampperthread is confusing - is is really the number of incoming bytes processed per thread
+    //UnpackKernel<<<cudablocks[0], cudathreads[0], 0, 0>>>(drawdata, dunpacked, nopols, sampperthread, rem, accumulate * vdiflen, 8 / inbits);
+    //cudaDeviceSynchronize();
+    //cudaCheckError(cudaGetLastError());
+    //cout << "Unpacked the data" << endl;
+    //PowerScaleKernel<<<cudablocks[1], cudathreads[1], 0, 0>>>(dffted, dfilbuffer, avgfreq, avgtime, filchans, perblock, 0, 1, 131072, 0, 0, perframe);
+    //cudaDeviceSynchronize();
+    //cudaCheckError(cudaGetLastError());
+    //cout << "Got the power" << endl;
+    // NOTE: That version calls 8000 blocks for accumulate of 4000 - more than I'm comfortable with
+    //UnpackKernelOpt<<<accumulate * vdiflen / 1024, 1024, 0, 0>>>(drawdata, dunpacked, nopols, sampperthread, rem, accumulate * vdiflen, 8 / inbits);
+    //cudaDeviceSynchronize();
+    //cudaCheckError(cudaGetLastError());
+    //UnpackKernelOpt2<<<accumulate * vdiflen / 1024 / (2 * perblock), 1024, 0, 0>>>(drawdata, dunpacked, nopols, 2 * perblock, accumulate * vdiflen);
+    //cudaDeviceSynchronize();
+    //cudaCheckError(cudaGetLastError());
+    UnpackKernelOpt3<<<50, 1024, 0, 0>>>(drawdata, dunpacked, nopols, 625, accumulate * vdiflen);
+    cudaDeviceSynchronize();
     cudaCheckError(cudaGetLastError());
-    PowerScaleKernel<<<cudablocks[1], cudathreads[1], 0, 0>>>(dffted, dfilbuffer, avgfreq, avgtime, filchans, perblock, 0, 1, 131072, 0, 0, perframe);
+    PowerScaleKernelOpt<<<25, 512, 0, 0>>>(dffted, dfilbuffer, avgfreq, avgtime, filchans, 625, 0, 1, 131072, 0, 0, perframe);
+    cudaDeviceSynchronize();
+    cudaCheckError(cudaGetLastError());
+    PowerScaleKernelOpt2<<<25, 512, 0, 0>>>(dffted, dfilbuffer, avgfreq, avgtime, filchans, 625, 0, 1, 131072, 0, 0);
+    cudaDeviceSynchronize();
     cudaCheckError(cudaGetLastError());
 }
